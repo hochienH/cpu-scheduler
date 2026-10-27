@@ -9,3 +9,6 @@ dist/
 !bench/*.csv
 !sim/traces/README.md
 *.log
+
+# 交接檔只留本機（含實驗室路徑與內部專案名，2026-10-28 從 history 移除）
+PROGRESS.md
