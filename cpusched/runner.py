@@ -1,0 +1,211 @@
+"""`cpusched run`: launch a command in a scope and steer its CPUQuota from the load other users generate.
+
+Also `watch` (the same loop without a job, printing what it would do) and `status`.
+"""
+from __future__ import annotations
+
+import csv
+import datetime as dt
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from . import cgroup as cg
+from . import systemd
+from .policy import PolicyConfig, PolicyState, decide, target
+from .sampler import Load, LoadSampler
+
+LOG_FIELDS = ["time", "dt", "nproc", "total_busy", "mine", "others", "system", "procs_running", "load1",
+              "share", "target", "quota", "action", "scope_cores", "scope_throttled", "scope_nr_throttled",
+              "per_uid"]
+
+
+def default_log_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return Path(base) / "cpusched"
+
+
+def fmt_per_uid(per_uid: dict[int, float], me: int) -> str:
+    items = sorted(((u, c) for u, c in per_uid.items() if c >= 0.05), key=lambda x: -x[1])
+    return ";".join(f"{'me' if u == me else u}:{c:.1f}" for u, c in items)
+
+
+def _f(x: float | None, nd: int = 2) -> str:
+    return "" if x is None else f"{x:.{nd}f}"
+
+
+def log_row(load: Load, cfg: PolicyConfig, tgt: int, quota: int, action: str, me: int) -> dict[str, str]:
+    return {
+        "time": dt.datetime.now().isoformat(timespec="seconds"), "dt": _f(load.dt, 1),
+        "nproc": str(load.nproc), "total_busy": _f(load.total_busy), "mine": _f(load.mine),
+        "others": _f(load.others), "system": _f(load.system), "procs_running": str(load.procs_running),
+        "load1": _f(load.load1), "share": str(cfg.share), "target": str(tgt), "quota": str(quota),
+        "action": action, "scope_cores": _f(load.scope), "scope_throttled": _f(load.scope_throttled, 3),
+        "scope_nr_throttled": "" if load.scope_nr_throttled is None else str(load.scope_nr_throttled),
+        "per_uid": fmt_per_uid(load.per_uid, me),
+    }
+
+
+def say(msg: str) -> None:
+    print(f"[cpusched] {msg}", file=sys.stderr, flush=True)
+
+
+def describe(load: Load, cfg: PolicyConfig, tgt: int, quota: int, action: str) -> str:
+    free = load.nproc - load.total_busy
+    return (f"others={load.others:.1f} mine={load.mine:.1f} free={free:.1f}/{load.nproc} "
+            f"share={cfg.share} target={tgt} quota={quota} {action}")
+
+
+def _wait(proc: subprocess.Popen, seconds: float) -> bool:
+    """True if the process exited within `seconds`."""
+    try:
+        proc.wait(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def run(cmd: list[str], cfg: PolicyConfig, interval: float, label: str | None = None,
+        log_path: Path | None = None, verbose: bool = False, presample: float = 2.0) -> int:
+    """Run `cmd` under a steered CPUQuota; return its exit status (128+signal if it was killed)."""
+    reason = systemd.available()
+    if reason:
+        raise SystemExit(f"cpusched: {reason}")
+    if not systemd.cpu_delegated():
+        raise SystemExit("cpusched: the cpu controller is not delegated to your user slice; "
+                         "CPUQuota cannot be set without root on this machine")
+    sampler = LoadSampler()
+    me = sampler.uid
+
+    first = sampler.snapshot()
+    time.sleep(presample)
+    load = sampler.diff(first, sampler.snapshot())
+    try:
+        cfg.share = len(systemd.list_scopes()) + 1
+    except systemd.SystemdError as e:
+        say(f"warning: {e}")
+    state = PolicyState(quota=target(load.nproc, load.others, cfg))
+
+    unit = systemd.unit_name(label or os.path.basename(cmd[0]))
+    proc = systemd.launch_scope(unit, cmd, state.quota)
+
+    def forward(signum: int, _frame) -> None:
+        name = signal.Signals(signum).name.removeprefix("SIG")
+        try:
+            systemd.kill_scope(unit, name)
+        except systemd.SystemdError as e:
+            say(f"could not forward SIG{name}: {e}")
+
+    signal.signal(signal.SIGTERM, forward)
+    signal.signal(signal.SIGHUP, forward)
+    # Ctrl-C from the terminal already reaches the job (same foreground process group); if the wrapper
+    # also forwarded it the job would see it twice, so the wrapper itself ignores SIGINT.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    for _ in range(50):                                   # the unit can take a moment to appear
+        if proc.poll() is not None:
+            break
+        try:
+            sampler.scope_path = systemd.control_group(unit)
+        except systemd.SystemdError:
+            sampler.scope_path = None
+        if sampler.scope_path is not None:
+            break
+        time.sleep(0.1)
+
+    log = writer = None
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = open(log_path, "w", newline="")
+        writer = csv.DictWriter(log, fieldnames=LOG_FIELDS)
+        writer.writeheader()
+
+    def emit(load: Load, tgt: int, action: str) -> None:
+        if writer is not None:
+            writer.writerow(log_row(load, cfg, tgt, state.quota, action, me))
+            log.flush()
+        if verbose:
+            say(describe(load, cfg, tgt, state.quota, action))
+
+    say(f"unit {unit}.scope pid {proc.pid} quota {state.quota} cores "
+        f"(min {cfg.min_cores}, max {cfg.max_cores}, margin {cfg.margin:g}, every {interval:g}s)"
+        + (f"; log {log_path}" if log_path else ""))
+    emit(load, state.quota, "start")
+
+    prev = sampler.snapshot()
+    try:
+        while not _wait(proc, interval):
+            cur = sampler.snapshot()
+            load = sampler.diff(prev, cur)
+            prev = cur
+            try:
+                cfg.share = max(len(systemd.list_scopes()), 1)
+            except systemd.SystemdError as e:
+                say(f"warning: {e}")
+            tgt = target(load.nproc, load.others, cfg)
+            quota, action = decide(load.nproc, load.others, cfg, state)
+            if action in ("up", "down"):
+                try:
+                    systemd.set_quota(unit, quota)
+                except systemd.SystemdError as e:
+                    if proc.poll() is None:
+                        say(f"set-property failed: {e}")
+                    action += "-failed"
+            emit(load, tgt, action)
+    finally:
+        if log is not None:
+            log.close()
+
+    rc = proc.returncode
+    if rc < 0:
+        say(f"job killed by signal {-rc}")
+        return 128 - rc
+    return rc
+
+
+def watch(cfg: PolicyConfig, interval: float, count: int | None = None) -> int:
+    """Dry run: sample like `run` would and print the decision, without starting anything."""
+    sampler = LoadSampler()
+    prev = sampler.snapshot()
+    time.sleep(min(interval, 2.0))
+    load = sampler.diff(prev, sampler.snapshot())
+    state = PolicyState(quota=target(load.nproc, load.others, cfg))
+    say(describe(load, cfg, state.quota, state.quota, "start"))
+    prev = sampler.snapshot()
+    n = 0
+    while count is None or n < count:
+        time.sleep(interval)
+        cur = sampler.snapshot()
+        load = sampler.diff(prev, cur)
+        prev = cur
+        tgt = target(load.nproc, load.others, cfg)
+        quota, action = decide(load.nproc, load.others, cfg, state)
+        say(describe(load, cfg, tgt, quota, action) + "  " + fmt_per_uid(load.per_uid, sampler.uid))
+        n += 1
+    return 0
+
+
+def status() -> int:
+    """List my cpusched scopes on this machine with their current cap and usage."""
+    reason = systemd.available()
+    if reason:
+        raise SystemExit(f"cpusched: {reason}")
+    units = systemd.list_scopes()
+    if not units:
+        print("no cpusched scopes running")
+        return 0
+    print(f"{'unit':50} {'cap':>6} {'used_s':>9} {'thr_s':>8} {'nr_thr':>7}")
+    for u in units:
+        try:
+            path = systemd.control_group(u)
+        except systemd.SystemdError:
+            path = None
+        st = cg.read_cpu_stat(path) if path else {}
+        cm = cg.read_cpu_max(path) if path else None
+        cap = "max" if cm is None or cm[0] is None else f"{cm[0]:g}"
+        print(f"{u:50} {cap:>6} {st.get('usage_usec', 0) / 1e6:9.0f} "
+              f"{st.get('throttled_usec', 0) / 1e6:8.0f} {st.get('nr_throttled', 0):7d}")
+    return 0

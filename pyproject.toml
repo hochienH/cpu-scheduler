@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpusched"
+version = "0.1.0"
+description = "Run a CPU-bound job on a shared Linux machine under a CPU quota that follows what other users leave free"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+cpusched = "cpusched.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["cpusched*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
