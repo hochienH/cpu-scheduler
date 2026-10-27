@@ -103,8 +103,12 @@ interval); and if the admin has put a CPUQuota on my whole user slice, `max` is 
 If `set-property` fails, the state is rolled back so the next interval retries, the row is logged
 with action `up-failed`/`down-failed`, and the `cap` column always shows the scope's real `cpu.max`.
 
-Defaults: interval 30 s, min 2, max nproc/2, margin 4, up_steps 2. These are placeholders until the
-trace-driven simulation (sim/) picks them.
+Defaults: interval 30 s, min 2, max nproc/2, margin 4, up_steps 2. Adopted 2026-10-28 on the
+strength of a 4-hour trace preview (`sim/preview_1027.md`): on the two busy hosts 30 s is the knee
+between contention (grows with the interval) and quota churn (falls with it), margin 2 and 4 are
+equivalent, margin 8 wastes cores on 20-core hosts, up_steps 2 halves the churn of 1 at equal
+contention. To be revisited with the full 48-hour traces (`sim/simulate.py`, recorders stop
+2026-10-29 18:04), which include the daytime hours where contention actually happens.
 
 ## Costs of the loop
 
