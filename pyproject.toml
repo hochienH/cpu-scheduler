@@ -7,6 +7,8 @@ name = "cpusched"
 version = "0.1.0"
 description = "Run a CPU-bound job on a shared Linux machine under a CPU quota that follows what other users leave free"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = []
 
