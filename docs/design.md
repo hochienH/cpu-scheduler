@@ -110,6 +110,12 @@ equivalent, margin 8 wastes cores on 20-core hosts, up_steps 2 halves the churn 
 contention. To be revisited with the full 48-hour traces (`sim/simulate.py`, recorders stop
 2026-10-29 18:04), which include the daytime hours where contention actually happens.
 
+Measured (2026-10-28, `bench/down_path_results.md`): with artificial load on hostA and hostB the
+down path fires at the first interval that sees the load (40 → 31–32 when others reach 44; 40 → 28
+→ 25 → 24 when demand exceeds the machine), the quota converges to nproc − others − margin, and the
+up path returns to 40 two to four intervals after the load leaves. The saturation shortcut did not
+fire in those runs because the back-off itself keeps `total_busy` below nproc − 0.5.
+
 ## Costs of the loop
 
 - Re-evaluation itself: two file reads and one D-Bus call per interval, about 10 ms. Negligible.
