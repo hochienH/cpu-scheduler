@@ -29,12 +29,20 @@ every `user-<uid>.slice` has weight 100, so nice only reorders processes inside 
 
 ## Affinity: the quota alone is not enough
 
-Measured with bench/throttle_overhead.py (same CPU-bound Pool.map, wall time, medians):
+Measured with bench/throttle_overhead.py (same CPU-bound Pool.map, wall time, medians; CSVs in bench/).
 
-| machine | cap | workers | quota only | affinity only | quota + affinity |
-|---|---|---|---|---|---|
-| hostA (80 CPUs) | 2 | 32 | +248 % | +12 % | -1 % |
-| hostC (36 CPUs) | 2 | 32 | +428 % (quota-only run) | | |
+hostC (36 CPUs, i9-10980XE), quota only, 3 reps:
+
+| cap K | workers N | N/K | wall vs K uncapped workers |
+|---|---|---|---|
+| 2 / 4 / 8 | K | 1 | +0.3 % / -2.0 % / -0.8 % |
+| 2 / 4 / 8 | 2K | 2 | +54 % / +54 % / +53 % |
+| 2 / 4 / 8 | 4K | 4 | +173 % / +157 % / +307 % |
+| 2 / 4 / 8 | 8K | 8 | +250 % / +444 % / +389 % |
+| 2 / 4 / 8 | 16K | 16 | +452 % / +501 % / +389 % |
+
+hostA (80 CPUs), cap 2, 32 workers, 1 rep: quota only +248 %, affinity only +12 %, quota + affinity -1 %.
+(hostC quota/affinity/both table: bench/throttle_modes_hostC.csv, see below once run.)
 
 With N workers and a K-core quota, CFS lets all N run for a burst each 100 ms period on N different
 CPUs and then throttles them; every CPU looks a few percent busy, so intel_pstate (powersave) never
