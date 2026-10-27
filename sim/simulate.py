@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from cpusched.policy import PolicyConfig, PolicyState, decide, target  # noqa: E402
+from cpusched.policy import PolicyConfig, PolicyState, decide, is_saturated, target  # noqa: E402
 
 
 def load_trace(path: Path) -> tuple[list[float], int, str]:
@@ -50,7 +50,9 @@ def simulate(others: list[float], nproc: int, cfg: PolicyConfig, interval: int, 
     quotas = []
     for t in range(T):
         if t and t % interval == 0:
-            _, action = decide(nproc, statistics.fmean(others[t - interval:t]), cfg, state)
+            o = statistics.fmean(others[t - interval:t])
+            sat = is_saturated(nproc, o + min(state.quota, demand))     # what /proc/stat would have shown
+            _, action = decide(nproc, o, cfg, state, saturated=sat)
             changes += action in ("up", "down")
         q = state.quota
         use = min(q, demand)

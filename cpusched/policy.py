@@ -35,14 +35,25 @@ def target(nproc: int, others: float, cfg: PolicyConfig) -> int:
     return max(cfg.min_cores, min(cfg.max_cores, t))
 
 
-def decide(nproc: int, others: float, cfg: PolicyConfig, state: PolicyState) -> tuple[int, str]:
+SATURATION_SLACK = 0.5
+
+
+def is_saturated(nproc: int, total_busy: float, slack: float = SATURATION_SLACK) -> bool:
+    """The whole machine is busy: others' usage no longer shows their demand, so go to the floor."""
+    return total_busy >= nproc - slack
+
+
+def decide(nproc: int, others: float, cfg: PolicyConfig, state: PolicyState,
+           saturated: bool = False) -> tuple[int, str]:
     """Update `state` in place and return (quota, action).
 
     Scaling down is immediate. Scaling up needs `cfg.up_steps` consecutive intervals whose target is
     above the current quota, and then goes to the smallest of those targets, so one quiet interval
     in a noisy period does not hand the job a burst of cores it has to give back at once.
+    When the machine is saturated the target is the floor at once: on a full machine others can only
+    show the cores we leave them, so the usual back-off would be limited to `margin` cores per step.
     """
-    t = target(nproc, others, cfg)
+    t = cfg.min_cores if saturated else target(nproc, others, cfg)
     if t < state.quota:
         state.quota, state.up_count, state.up_min = t, 0, 0
         return t, "down"

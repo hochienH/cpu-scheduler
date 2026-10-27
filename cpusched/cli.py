@@ -23,7 +23,7 @@ def _policy_args(sp: argparse.ArgumentParser) -> None:
 
 def _policy(ns: argparse.Namespace) -> PolicyConfig:
     n = cg.nproc()
-    max_cores = ns.max_cores if ns.max_cores is not None else max(n // 2, 1)
+    max_cores = ns.max_cores if ns.max_cores is not None else max(n // 2, ns.min_cores, 1)
     if ns.min_cores < 1:
         raise SystemExit("cpusched: --min must be >= 1")
     if max_cores < ns.min_cores:
@@ -77,22 +77,23 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     ns = build_parser().parse_args(argv)
     if ns.cmd == "run":
-        from .runner import default_log_dir, run
-        from .systemd import unit_name
+        from .runner import run
         cmd = list(ns.command)
         if cmd and cmd[0] == "--":
             cmd = cmd[1:]
         if not cmd:
             raise SystemExit("cpusched run: no command given (write it after --)")
         cfg = _policy(ns)
-        log = None if ns.no_log else (ns.log or default_log_dir() / (unit_name(ns.label or cmd[0]) + ".csv"))
-        return run(cmd, cfg, ns.interval, label=ns.label, log_path=log, verbose=ns.verbose,
+        log = False if ns.no_log else (ns.log or True)
+        return run(cmd, cfg, ns.interval, label=ns.label, log=log, verbose=ns.verbose,
                    pin=not ns.no_affinity)
     if ns.cmd == "watch":
         from .runner import watch
         return watch(_policy(ns), ns.interval, ns.count)
     if ns.cmd == "record":
         from .recorder import record
+        if ns.interval < 0.2:
+            raise SystemExit("cpusched record: --interval must be >= 0.2 seconds")
         return record(ns.out, ns.interval, ns.duration)
     if ns.cmd == "status":
         from .runner import status

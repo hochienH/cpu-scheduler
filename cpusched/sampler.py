@@ -1,8 +1,11 @@
 """Turn two snapshots of the counters into 'how many cores is everybody using'.
 
-`others` (what the policy acts on) is machine-wide busy cores from /proc/stat minus the usage of my
-own user slice (all my processes, all sessions, all cpusched instances). The per-user breakdown from
-the other user slices is informational: it says who is using the machine, and the modelling uses it.
+`others` (what the policy acts on) is machine-wide busy cores from /proc/stat minus what my own
+cpusched scopes use (`managed`). Everything else of mine (an editor, a stray job without cpusched)
+counts as `others` on purpose: the budget is about the whole machine, and only the managed scopes
+are what this controller can give back. `mine` (my whole user slice) and the per-user breakdown of
+the other user slices are informational: they say who is using the machine, and the modelling uses
+them.
 """
 from __future__ import annotations
 
@@ -13,6 +16,8 @@ from pathlib import Path
 
 from . import cgroup as cg
 
+SCOPE_GLOB = "cpusched-*.scope"
+
 
 @dataclass
 class Snapshot:
@@ -21,6 +26,7 @@ class Snapshot:
     busy_j: int                     # /proc/stat busy jiffies
     total_j: int                    # /proc/stat total jiffies
     slices: dict[int, int]          # uid -> usage_usec of user-<uid>.slice
+    managed: dict[str, int]         # my cpusched scope name -> usage_usec
     system_usec: int | None         # system.slice usage_usec
     procs_running: int
     load1: float
@@ -34,14 +40,15 @@ class Load:
     dt: float
     nproc: int
     total_busy: float               # cores, whole machine (/proc/stat)
-    mine: float                     # cores, my user slice
-    others: float                   # cores, everything that is not my slice (>= 0)
+    mine: float                     # cores, my user slice (all my processes)
+    managed: float                  # cores, my cpusched scopes (part of `mine`)
+    others: float                   # cores, everything that is not managed by cpusched (>= 0)
     system: float                   # cores, system.slice (part of `others`)
     per_uid: dict[int, float] = field(default_factory=dict)   # cores per user slice, mine included
     procs_running: int = 0
     load1: float = 0.0
     scope: float | None = None              # cores used by the controlled scope
-    scope_throttled: float | None = None    # throttled seconds per wall second (0..1 per core-ish)
+    scope_throttled: float | None = None    # throttled time per wall second, summed over runqueues
     scope_nr_throttled: int | None = None   # throttled CFS periods in the interval
 
 
@@ -53,6 +60,13 @@ class LoadSampler:
         self.uid = os.getuid() if uid is None else uid
         self.ncpu = cg.nproc() if ncpu is None else ncpu
         self.scope_path = scope_path
+        self.app_slice = cg.user_slice(self.uid, self.root) / f"user@{self.uid}.service" / "app.slice"
+
+    def managed_scopes(self) -> dict[str, Path]:
+        try:
+            return {p.name: p for p in self.app_slice.glob(SCOPE_GLOB)}
+        except OSError:
+            return {}
 
     def snapshot(self) -> Snapshot:
         busy, total = cg.read_proc_stat(self.procfs)
@@ -61,9 +75,14 @@ class LoadSampler:
             st = cg.read_cpu_stat(path)
             if "usage_usec" in st:
                 slices[uid] = st["usage_usec"]
+        managed: dict[str, int] = {}
+        for name, path in self.managed_scopes().items():
+            st = cg.read_cpu_stat(path)
+            if "usage_usec" in st:
+                managed[name] = st["usage_usec"]
         system = cg.read_cpu_stat(self.root / "system.slice").get("usage_usec")
         snap = Snapshot(t=time.monotonic(), wall=time.time(), busy_j=busy, total_j=total,
-                        slices=slices, system_usec=system,
+                        slices=slices, managed=managed, system_usec=system,
                         procs_running=cg.read_procs_running(self.procfs),
                         load1=cg.read_load1(self.procfs))
         if self.scope_path is not None:
@@ -81,9 +100,10 @@ class LoadSampler:
         for uid, usec in b.slices.items():
             if uid in a.slices:                      # a slice that appeared mid-interval is skipped once
                 per_uid[uid] = max(usec - a.slices[uid], 0) / 1e6 / dt
+        managed = sum(max(usec - a.managed[n], 0) for n, usec in b.managed.items() if n in a.managed) / 1e6 / dt
         mine = per_uid.get(self.uid, 0.0)
-        load = Load(dt=dt, nproc=self.ncpu, total_busy=total_busy, mine=mine,
-                    others=max(total_busy - mine, 0.0),
+        load = Load(dt=dt, nproc=self.ncpu, total_busy=total_busy, mine=mine, managed=managed,
+                    others=max(total_busy - managed, 0.0),
                     system=_rate(a.system_usec, b.system_usec, dt) or 0.0,
                     per_uid=per_uid, procs_running=b.procs_running, load1=b.load1)
         if b.scope_usec is not None:

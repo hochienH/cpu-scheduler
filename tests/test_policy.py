@@ -1,4 +1,4 @@
-from cpusched.policy import PolicyConfig, PolicyState, decide, target
+from cpusched.policy import PolicyConfig, PolicyState, decide, is_saturated, target
 
 
 def cfg(**kw):
@@ -52,3 +52,9 @@ def test_down_during_up_streak_clears_the_streak():
     decide(80, 60, c, s)                            # hold-up (target 16)
     assert decide(80, 74, c, s) == (2, "down")
     assert s.up_count == 0 and s.up_min == 0
+
+
+def test_saturated_machine_goes_to_the_floor_at_once():
+    c, s = cfg(), PolicyState(quota=16)
+    assert decide(80, 10, c, s, saturated=True) == (2, "down")   # whatever `others` says
+    assert is_saturated(80, 79.6) and not is_saturated(80, 79.4)

@@ -14,7 +14,8 @@ from pathlib import Path
 from .runner import fmt_per_uid
 from .sampler import LoadSampler
 
-FIELDS = ["time", "dt", "nproc", "total_busy", "mine", "others", "system", "procs_running", "load1", "per_uid"]
+FIELDS = ["time", "dt", "nproc", "total_busy", "mine", "managed", "others", "system", "procs_running", "load1",
+          "per_uid"]
 
 
 def record(out: Path, interval: float = 1.0, duration: float | None = None) -> int:
@@ -37,6 +38,7 @@ def record(out: Path, interval: float = 1.0, duration: float | None = None) -> i
             w.writerow({
                 "time": dt.datetime.now().isoformat(timespec="seconds"), "dt": f"{load.dt:.2f}",
                 "nproc": load.nproc, "total_busy": f"{load.total_busy:.2f}", "mine": f"{load.mine:.2f}",
+                "managed": f"{load.managed:.2f}",
                 "others": f"{load.others:.2f}", "system": f"{load.system:.2f}",
                 "procs_running": load.procs_running, "load1": f"{load.load1:.2f}",
                 "per_uid": fmt_per_uid(load.per_uid, sampler.uid),

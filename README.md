@@ -38,7 +38,9 @@ Use the installed script from anywhere, e.g. in tmux:
 ~/cpu-scheduler/.venv/bin/cpusched run -v -- ~/.venv/bin/python src/build_corpus.py --workers 32
 ```
 
-The log (one row per decision, CSV) lands in `~/.local/state/cpusched/<unit>.csv`.
+The log (one row per decision, CSV) lands in `~/.local/state/cpusched/<unit>.csv`. Ctrl-C, SIGTERM
+and SIGHUP to the wrapper are forwarded once to every process in the scope (again: SIGTERM, then
+SIGKILL); the wrapper keeps the cap on until the scope is empty, even if the main process exits first.
 
 ## 中文說明
 

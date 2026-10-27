@@ -53,11 +53,13 @@ def launch_scope(unit: str, cmd: list[str], cores: int) -> subprocess.Popen:
     """Start `cmd` inside a transient user scope with an initial CPUQuota.
 
     systemd-run --scope registers the scope and then execs the command in place, so the returned
-    Popen's pid is the job's pid and its exit status is the job's exit status.
+    Popen's pid is the job's pid and its exit status is the job's exit status. The job gets its own
+    session (and process group) so terminal signals reach only the wrapper, which forwards each one
+    exactly once to the whole scope.
     """
     argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit", unit,
             "-p", quota_arg(cores), "--", *cmd]
-    return subprocess.Popen(argv)
+    return subprocess.Popen(argv, start_new_session=True)
 
 
 def _ctl(*args: str) -> str:

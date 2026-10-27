@@ -70,9 +70,11 @@ change, or that reset their own mask, are caught. `--no-affinity` turns this off
 
 - `total_busy` = busy cores over the interval from `/proc/stat` (user+nice+system+irq+softirq+steal
   jiffies over all jiffies, times the CPU count). This counts everything, kernel threads included.
-- `mine` = usage delta of `user.slice/user-<me>.slice/cpu.stat` (all my processes, all sessions,
-  all cpusched instances).
-- `others = max(total_busy - mine, 0)`.
+- `managed` = usage delta of my `cpusched-*.scope` cgroups (every instance on this machine).
+- `others = max(total_busy - managed, 0)`. My own unmanaged processes (an editor, a job started
+  without cpusched) count as `others` on purpose: the budget is about the whole machine, and only
+  the managed scopes are what this controller can give back.
+- `mine` = usage delta of `user.slice/user-<me>.slice/cpu.stat` (all my processes), logged only.
 - Per-user usage of every other `user-<uid>.slice` and of `system.slice` is read for the logs (the
   files are world-readable); `procs_running` and `load1` are logged too.
 
@@ -92,6 +94,15 @@ Why this converges: with quota K and others using everything else, `others = npr
 `target = K - margin < K` and we scale down. With `free > margin` we scale up. The steady state keeps
 at least `margin` cores free, which is also the signal that lets other users' demand show up as usage.
 
+On a full machine that back-off is only `margin` cores per interval (others can show no more than
+we leave them), so there is a shortcut: when `total_busy >= nproc - 0.5` the target is the floor at
+once (`policy.is_saturated`). Two more rules in `run`: a second instance of mine joins at the floor
+and climbs through the normal up path (the first instance only sees the new share at its next
+interval); and if the admin has put a CPUQuota on my whole user slice, `max` is lowered to it.
+
+If `set-property` fails, the state is rolled back so the next interval retries, the row is logged
+with action `up-failed`/`down-failed`, and the `cap` column always shows the scope's real `cpu.max`.
+
 Defaults: interval 30 s, min 2, max nproc/2, margin 4, up_steps 2. These are placeholders until the
 trace-driven simulation (sim/) picks them.
 
@@ -110,11 +121,18 @@ so it is measured (cpusched record) and simulated rather than guessed.
 ## Known limits
 
 - One machine at a time; nothing coordinates across servers.
-- If the wrapper dies (SIGKILL), the scope keeps running with the last quota. `cpusched status`
-  shows it; `cpusched stop` signals every process in it.
-- The wrapper ignores SIGINT because the terminal already delivers it to the job; a job that ignores
-  SIGINT must be stopped with `cpusched stop` or SIGTERM to the wrapper (which is forwarded to the
-  whole scope).
+- The job runs in its own session: Ctrl-C and hang-ups reach the wrapper, which forwards each
+  signal once to every process in the scope (SIGINT, SIGTERM, SIGHUP; a signal the wrapper inherited
+  as ignored, e.g. under nohup, stays ignored). A second signal sends SIGTERM, a third SIGKILL.
+  Interactive stdin is not supported.
+- The controller runs until the scope is empty: if the main process exits but leaves workers or
+  daemons behind, they stay capped and the wrapper says so; `cpusched stop UNIT` ends them.
+- If the wrapper itself crashes it sends SIGTERM to the scope rather than leave the job uncapped;
+  errors inside one control interval (log on a full disk, a closed stderr) are reported and the
+  loop continues. Only SIGKILL of the wrapper leaves a scope running with its last cap:
+  `cpusched status` shows it.
+- Two users both running cpusched with the same interval can chase each other (one's up is the
+  other's down); the up delay damps it but does not remove it. Nothing coordinates across users.
 - `others` includes the kernel and system services; that is intended (they need the cores too).
 - Pinning overrides whatever affinity the job sets for itself, once per interval.
 - The CPU set is only recomputed when the quota changes; if another user lands on one of our CPUs

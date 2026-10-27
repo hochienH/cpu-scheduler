@@ -17,12 +17,12 @@ from pathlib import Path
 from . import affinity as af
 from . import cgroup as cg
 from . import systemd
-from .policy import PolicyConfig, PolicyState, decide, target
+from .policy import PolicyConfig, PolicyState, decide, is_saturated, target
 from .sampler import Load, LoadSampler
 
-LOG_FIELDS = ["time", "dt", "nproc", "total_busy", "mine", "others", "system", "procs_running", "load1",
-              "share", "target", "quota", "action", "cpus", "pinned", "scope_cores", "scope_throttled",
-              "scope_nr_throttled", "per_uid"]
+LOG_FIELDS = ["time", "dt", "nproc", "total_busy", "mine", "managed", "others", "system", "procs_running",
+              "load1", "share", "target", "quota", "cap", "action", "cpus", "pinned", "scope_cores",
+              "scope_throttled", "scope_nr_throttled", "per_uid"]
 
 
 def default_log_dir() -> Path:
@@ -40,12 +40,14 @@ def _f(x: float | None, nd: int = 2) -> str:
 
 
 def log_row(load: Load, cfg: PolicyConfig, tgt: int, quota: int, action: str, me: int,
-            cpus: list[int] | None = None, pinned: int | None = None) -> dict[str, str]:
+            cpus: list[int] | None = None, pinned: int | None = None,
+            cap: float | None = None) -> dict[str, str]:
     return {
         "time": dt.datetime.now().isoformat(timespec="seconds"), "dt": _f(load.dt, 1),
         "nproc": str(load.nproc), "total_busy": _f(load.total_busy), "mine": _f(load.mine),
-        "others": _f(load.others), "system": _f(load.system), "procs_running": str(load.procs_running),
-        "load1": _f(load.load1), "share": str(cfg.share), "target": str(tgt), "quota": str(quota),
+        "managed": _f(load.managed), "others": _f(load.others), "system": _f(load.system),
+        "procs_running": str(load.procs_running), "load1": _f(load.load1), "share": str(cfg.share),
+        "target": str(tgt), "quota": str(quota), "cap": "" if cap is None else f"{cap:g}",
         "action": action, "cpus": af.fmt_cpus(cpus) if cpus else "",
         "pinned": "" if pinned is None else str(pinned),
         "scope_cores": _f(load.scope), "scope_throttled": _f(load.scope_throttled, 3),
@@ -55,15 +57,78 @@ def log_row(load: Load, cfg: PolicyConfig, tgt: int, quota: int, action: str, me
 
 
 def say(msg: str) -> None:
-    print(f"[cpusched] {msg}", file=sys.stderr, flush=True)
+    try:
+        print(f"[cpusched] {msg}", file=sys.stderr, flush=True)
+    except OSError:                                   # stderr closed (a dead pipe): keep running silently
+        pass
 
 
 def describe(load: Load, cfg: PolicyConfig, tgt: int, quota: int, action: str,
-             cpus: list[int] | None = None) -> str:
+             cpus: list[int] | None = None, cap: float | None = None) -> str:
     free = load.nproc - load.total_busy
-    s = (f"others={load.others:.1f} mine={load.mine:.1f} free={free:.1f}/{load.nproc} "
+    s = (f"others={load.others:.1f} managed={load.managed:.1f} free={free:.1f}/{load.nproc} "
          f"share={cfg.share} target={tgt} quota={quota} {action}")
+    if cap is not None and cap != quota:
+        s += f" cap={cap:g}"
     return s + (f" cpus={af.fmt_cpus(cpus)}" if cpus else "")
+
+
+class CsvLog:
+    """The decision log. Opened before the job starts so a bad path fails first; a write error later
+    disables the log instead of ending the controller."""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        self.file = self.writer = None
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.file = open(path, "w", newline="")
+            self.writer = csv.DictWriter(self.file, fieldnames=LOG_FIELDS)
+            self.writer.writeheader()
+            self.file.flush()
+        except OSError as e:
+            raise SystemExit(f"cpusched: cannot write the log {path}: {e} (use --log PATH or --no-log)")
+
+    def write(self, row: dict[str, str]) -> None:
+        if self.writer is None:
+            return
+        try:
+            self.writer.writerow(row)
+            self.file.flush()
+        except OSError as e:
+            say(f"log write failed, logging stops but the controller continues: {e}")
+            self.close()
+
+    def close(self) -> None:
+        if self.file is not None:
+            try:
+                self.file.close()
+            except OSError:
+                pass
+        self.file = self.writer = None
+
+    def discard(self) -> None:
+        """Remove the file (used when the job never started)."""
+        self.close()
+        if self.path is not None:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+
+
+def apply_slice_cap(cfg: PolicyConfig, cap_cores: float | None) -> None:
+    """Honour a CPUQuota the admin set on my whole user slice: the scope can never get more."""
+    if cap_cores is None:
+        return
+    c = max(int(cap_cores), 1)
+    if c < cfg.max_cores:
+        say(f"your user slice is capped at {cap_cores:g} cores by the admin; --max lowered to {c}")
+        cfg.max_cores = c
+    if c < cfg.min_cores:
+        cfg.min_cores = c
 
 
 def _wait(proc: subprocess.Popen, seconds: float) -> bool:
@@ -76,13 +141,15 @@ def _wait(proc: subprocess.Popen, seconds: float) -> bool:
 
 
 def run(cmd: list[str], cfg: PolicyConfig, interval: float, label: str | None = None,
-        log_path: Path | None = None, verbose: bool = False, presample: float = 2.0,
-        pin: bool = True) -> int:
+        log: Path | bool = True, verbose: bool = False, presample: float = 2.0, pin: bool = True) -> int:
     """Run `cmd` under a steered CPUQuota; return its exit status (128+signal if it was killed).
 
+    `log`: True for the default CSV (~/.local/state/cpusched/<unit>.csv), a Path, or False for none.
     With `pin` (default) every task in the scope is also bound to `quota` CPUs chosen on distinct,
     idle physical cores: a quota alone lets N workers smear over the whole machine, where CFS
     throttling and frequency scaling cost up to 5x throughput (see bench/).
+    The controller keeps running until the scope is empty, not just until the main process exits,
+    and keeps the job under the agreed cap even if its own log or stderr fail.
     """
     reason = systemd.available()
     if reason:
@@ -92,104 +159,153 @@ def run(cmd: list[str], cfg: PolicyConfig, interval: float, label: str | None = 
                          "CPUQuota cannot be set without root on this machine")
     sampler = LoadSampler()
     me = sampler.uid
+    slice_max = cg.read_cpu_max(cg.user_slice(me))
+    apply_slice_cap(cfg, None if slice_max is None else slice_max[0])
+
+    unit = systemd.unit_name(label or os.path.basename(cmd[0]))
+    log_path = default_log_dir() / f"{unit}.csv" if log is True else (log or None)
+    csvlog = CsvLog(log_path)                           # before launching: a bad path fails here
+
     meter = af.PerCpuMeter() if pin else None
     topo = af.topology(ncpu=sampler.ncpu) if pin else {}
-
     first = sampler.snapshot()
     time.sleep(presample)
     load = sampler.diff(first, sampler.snapshot())
     busy = meter.update() if meter else {}
+    peers = 0
     try:
-        cfg.share = len(systemd.list_scopes()) + 1
+        peers = len(systemd.list_scopes())
     except systemd.SystemdError as e:
         say(f"warning: {e}")
-    state = PolicyState(quota=target(load.nproc, load.others, cfg))
+    cfg.share = peers + 1
+    tgt = target(load.nproc, load.others, cfg)
+    # With other instances of mine running, join at the floor: they only notice the new share at
+    # their next interval, so starting at the full share would oversubscribe the budget until then.
+    state = PolicyState(quota=cfg.min_cores if peers else tgt)
     cpus: list[int] = af.choose(state.quota, [], busy, topo) if pin else []
 
-    unit = systemd.unit_name(label or os.path.basename(cmd[0]))
     proc = systemd.launch_scope(unit, cmd, state.quota)
     # The pid survives systemd-run's exec and children inherit the mask at fork, so pinning the
     # main process now covers the workers it is about to start; later passes catch everything else.
     pinned = af.pin([proc.pid], cpus) if pin else None
 
+    nsig = 0
+
     def forward(signum: int, _frame) -> None:
+        nonlocal nsig
+        nsig += 1
         name = signal.Signals(signum).name.removeprefix("SIG")
+        send = name if nsig == 1 else ("TERM" if nsig == 2 else "KILL")
         try:
-            systemd.kill_scope(unit, name)
+            systemd.kill_scope(unit, send)
+            say(f"SIG{name}: sent SIG{send} to every process in {unit}.scope"
+                + (" (one more sends SIGKILL)" if nsig == 2 else ""))
         except systemd.SystemdError as e:
             say(f"could not forward SIG{name}: {e}")
 
-    signal.signal(signal.SIGTERM, forward)
-    signal.signal(signal.SIGHUP, forward)
-    # Ctrl-C from the terminal already reaches the job (same foreground process group); if the wrapper
-    # also forwarded it the job would see it twice, so the wrapper itself ignores SIGINT.
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # The job runs in its own session, so the terminal delivers Ctrl-C / hang-up to the wrapper only
+    # and each signal reaches the job exactly once. A signal the wrapper inherited as ignored (nohup)
+    # stays ignored.
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        if signal.getsignal(sig) != signal.SIG_IGN:
+            signal.signal(sig, forward)
 
-    for _ in range(50):                                   # the unit can take a moment to appear
-        if proc.poll() is not None:
-            break
-        try:
-            sampler.scope_path = systemd.control_group(unit)
-        except systemd.SystemdError:
-            sampler.scope_path = None
-        if sampler.scope_path is not None:
-            break
-        time.sleep(0.1)
-
-    def repin() -> int | None:
-        if not pin:
-            return None
-        tasks = af.scope_tasks(sampler.scope_path) if sampler.scope_path else [proc.pid]
-        return af.pin(tasks, cpus)
-
-    log = writer = None
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log = open(log_path, "w", newline="")
-        writer = csv.DictWriter(log, fieldnames=LOG_FIELDS)
-        writer.writeheader()
-
-    def emit(load: Load, tgt: int, action: str, pinned: int | None) -> None:
-        if writer is not None:
-            writer.writerow(log_row(load, cfg, tgt, state.quota, action, me, cpus, pinned))
-            log.flush()
-        if verbose:
-            say(describe(load, cfg, tgt, state.quota, action, cpus))
-
-    say(f"unit {unit}.scope pid {proc.pid} quota {state.quota} cores "
-        f"(min {cfg.min_cores}, max {cfg.max_cores}, margin {cfg.margin:g}, every {interval:g}s"
-        + (f", cpus {af.fmt_cpus(cpus)}" if pin else ", no pinning") + ")"
-        + (f"; log {log_path}" if log_path else ""))
-    emit(load, state.quota, "start", pinned)
-
-    prev = sampler.snapshot()
+    rc: int | None = None
     try:
-        while not _wait(proc, interval):
-            cur = sampler.snapshot()
-            load = sampler.diff(prev, cur)
-            prev = cur
-            busy = meter.update() if meter else {}
+        scope_path = None
+        for _ in range(50):                               # the unit can take a moment to appear
             try:
-                cfg.share = max(len(systemd.list_scopes()), 1)
-            except systemd.SystemdError as e:
-                say(f"warning: {e}")
-            tgt = target(load.nproc, load.others, cfg)
-            quota, action = decide(load.nproc, load.others, cfg, state)
-            if action in ("up", "down"):
-                try:
-                    systemd.set_quota(unit, quota)
-                except systemd.SystemdError as e:
-                    if proc.poll() is None:
-                        say(f"set-property failed: {e}")
-                    action += "-failed"
-                if pin:
-                    cpus = af.choose(quota, cpus, busy, topo)
-            emit(load, tgt, action, repin())
-    finally:
-        if log is not None:
-            log.close()
+                scope_path = systemd.control_group(unit)
+            except systemd.SystemdError:
+                scope_path = None
+            if scope_path is not None or proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        if scope_path is None and proc.poll() is not None:
+            rc = proc.returncode
+            say(f"launch failed: systemd-run exited with {rc} before the scope appeared; nothing is running")
+            csvlog.discard()
+            return rc or 1
+        sampler.scope_path = scope_path
 
-    rc = proc.returncode
+        def tasks() -> list[int]:
+            return af.scope_tasks(scope_path) if scope_path else []
+
+        def repin() -> int | None:
+            if not pin:
+                return None
+            return af.pin(tasks() or [proc.pid], cpus)
+
+        def cap_now() -> float | None:
+            cm = cg.read_cpu_max(scope_path) if scope_path else None
+            return None if cm is None else cm[0]
+
+        def emit(load: Load, tgt: int, action: str, pinned: int | None, cap: float | None) -> None:
+            csvlog.write(log_row(load, cfg, tgt, state.quota, action, me, cpus, pinned, cap))
+            if verbose:
+                say(describe(load, cfg, tgt, state.quota, action, cpus, cap))
+
+        say(f"unit {unit}.scope pid {proc.pid} quota {state.quota} cores "
+            f"(min {cfg.min_cores}, max {cfg.max_cores}, margin {cfg.margin:g}, every {interval:g}s"
+            + (f", cpus {af.fmt_cpus(cpus)}" if pin else ", no pinning") + ")"
+            + (f"; log {log_path}" if log_path else ""))
+        emit(load, tgt, "start", pinned, float(state.quota))
+
+        prev = sampler.snapshot()
+        leftover_warned = False
+        while True:
+            if rc is None:
+                if _wait(proc, interval):
+                    rc = proc.returncode
+            else:
+                time.sleep(interval)
+            if rc is not None:
+                left = tasks()
+                if not left:
+                    break
+                if not leftover_warned:
+                    say(f"main process exited with {rc} but {len(left)} tasks are still in {unit}.scope; "
+                        f"keeping the cap on them (`cpusched stop {unit}` ends them)")
+                    leftover_warned = True
+            try:
+                cur = sampler.snapshot()
+                load = sampler.diff(prev, cur)
+                prev = cur
+                busy = meter.update() if meter else {}
+                try:
+                    cfg.share = max(len(systemd.list_scopes()), 1)
+                except systemd.SystemdError as e:
+                    say(f"warning: {e}")
+                tgt = target(load.nproc, load.others, cfg)
+                before = state.quota
+                quota, action = decide(load.nproc, load.others, cfg, state,
+                                       saturated=is_saturated(load.nproc, load.total_busy))
+                if action in ("up", "down"):
+                    try:
+                        systemd.set_quota(unit, quota)
+                    except systemd.SystemdError as e:
+                        state.quota, state.up_count, state.up_min = before, 0, 0   # retry next interval
+                        action += "-failed"
+                        if proc.poll() is None or tasks():
+                            say(f"set-property failed, will retry: {e}")
+                    else:
+                        if pin:
+                            cpus = af.choose(quota, cpus, busy, topo)
+                emit(load, tgt, action, repin(), cap_now())
+            except Exception as e:                        # never leave the job uncontrolled
+                say(f"controller error, still watching the job: {e!r}")
+    except BaseException:
+        say(f"wrapper is exiting on an error; sending SIGTERM to {unit}.scope so the job does not run on uncapped")
+        try:
+            systemd.kill_scope(unit, "TERM")
+        except Exception:
+            pass
+        raise
+    finally:
+        csvlog.close()
+
+    if rc is None:
+        rc = proc.wait()
     if rc < 0:
         say(f"job killed by signal {-rc}")
         return 128 - rc
@@ -199,11 +315,21 @@ def run(cmd: list[str], cfg: PolicyConfig, interval: float, label: str | None = 
 def watch(cfg: PolicyConfig, interval: float, count: int | None = None) -> int:
     """Dry run: sample like `run` would and print the decision, without starting anything."""
     sampler = LoadSampler()
+    slice_max = cg.read_cpu_max(cg.user_slice(sampler.uid))
+    apply_slice_cap(cfg, None if slice_max is None else slice_max[0])
     meter = af.PerCpuMeter()
     topo = af.topology(ncpu=sampler.ncpu)
+
+    def share() -> int:
+        try:
+            return max(len(systemd.list_scopes()), 1)
+        except systemd.SystemdError:
+            return 1
+
     prev = sampler.snapshot()
     time.sleep(min(interval, 2.0))
     load = sampler.diff(prev, sampler.snapshot())
+    cfg.share = share()
     state = PolicyState(quota=target(load.nproc, load.others, cfg))
     cpus = af.choose(state.quota, [], meter.update(), topo)
     say(describe(load, cfg, state.quota, state.quota, "start", cpus))
@@ -215,8 +341,10 @@ def watch(cfg: PolicyConfig, interval: float, count: int | None = None) -> int:
         load = sampler.diff(prev, cur)
         prev = cur
         busy = meter.update()
+        cfg.share = share()
         tgt = target(load.nproc, load.others, cfg)
-        quota, action = decide(load.nproc, load.others, cfg, state)
+        quota, action = decide(load.nproc, load.others, cfg, state,
+                               saturated=is_saturated(load.nproc, load.total_busy))
         if action in ("up", "down"):
             cpus = af.choose(quota, cpus, busy, topo)
         say(describe(load, cfg, tgt, quota, action, cpus) + "  " + fmt_per_uid(load.per_uid, sampler.uid))
@@ -233,7 +361,7 @@ def status() -> int:
     if not units:
         print("no cpusched scopes running")
         return 0
-    print(f"{'unit':50} {'cap':>5} {'cpus':16} {'used_s':>8} {'thr_s':>7} {'nr_thr':>7}")
+    print(f"{'unit':50} {'cap':>5} {'cpus':16} {'tasks':>5} {'used_s':>8} {'thr_s':>7} {'nr_thr':>7}")
     for u in units:
         try:
             path = systemd.control_group(u)
@@ -242,13 +370,14 @@ def status() -> int:
         st = cg.read_cpu_stat(path) if path else {}
         cm = cg.read_cpu_max(path) if path else None
         cap = "max" if cm is None or cm[0] is None else f"{cm[0]:g}"
+        tids = af.scope_tasks(path) if path else []
         cpus = ""
-        for tid in af.scope_tasks(path) if path else []:
+        for tid in tids:
             try:
                 cpus = af.fmt_cpus(sorted(os.sched_getaffinity(tid)))
                 break
             except OSError:
                 continue
-        print(f"{u:50} {cap:>5} {cpus:16} {st.get('usage_usec', 0) / 1e6:8.0f} "
+        print(f"{u:50} {cap:>5} {cpus:16} {len(tids):5d} {st.get('usage_usec', 0) / 1e6:8.0f} "
               f"{st.get('throttled_usec', 0) / 1e6:7.0f} {st.get('nr_throttled', 0):7d}")
     return 0
