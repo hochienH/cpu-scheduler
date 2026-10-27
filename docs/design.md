@@ -41,8 +41,15 @@ hostC (36 CPUs, i9-10980XE), quota only, 3 reps:
 | 2 / 4 / 8 | 8K | 8 | +250 % / +444 % / +389 % |
 | 2 / 4 / 8 | 16K | 16 | +452 % / +501 % / +389 % |
 
-hostA (80 CPUs), cap 2, 32 workers, 1 rep: quota only +248 %, affinity only +12 %, quota + affinity -1 %.
-(hostC quota/affinity/both table: bench/throttle_modes_hostC.csv, see below once run.)
+hostC, quota versus affinity versus both, 2 reps (wall vs K uncapped workers):
+
+| cap K | workers N | quota only | affinity only | quota + affinity |
+|---|---|---|---|---|
+| 2 | 2 / 8 / 32 | +2 % / +170 % / +452 % | 0 % / -1 % / -1 % | -1 % / -1 % / +1 % |
+| 4 | 4 / 16 / 64 | +1 % / +162 % / +502 % | 0 % / -2 % / -2 % | -1 % / -3 % / -1 % |
+| 8 | 8 / 32 / 128 | -2 % / +324 % / +389 % | -2 % / -3 % / 0 % | -3 % / -4 % / 0 % |
+
+hostA (80 CPUs), cap 2, 32 workers, 1 rep: quota only +248 %, affinity only +12 %, both -1 %.
 
 With N workers and a K-core quota, CFS lets all N run for a burst each 100 ms period on N different
 CPUs and then throttles them; every CPU looks a few percent busy, so intel_pstate (powersave) never
