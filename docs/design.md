@@ -27,6 +27,30 @@ job must be launched through `cpusched run`.
 `nice` and `SCHED_IDLE` do not help here: CFS first splits time between cgroups by `cpu.weight`, and
 every `user-<uid>.slice` has weight 100, so nice only reorders processes inside our own slice.
 
+## Affinity: the quota alone is not enough
+
+Measured with bench/throttle_overhead.py (same CPU-bound Pool.map, wall time, medians):
+
+| machine | cap | workers | quota only | affinity only | quota + affinity |
+|---|---|---|---|---|---|
+| hostA (80 CPUs) | 2 | 32 | +248 % | +12 % | -1 % |
+| hostC (36 CPUs) | 2 | 32 | +428 % (quota-only run) | | |
+
+With N workers and a K-core quota, CFS lets all N run for a burst each 100 ms period on N different
+CPUs and then throttles them; every CPU looks a few percent busy, so intel_pstate (powersave) never
+raises their frequency, and the SMT siblings get in each other's way. The job pays with up to 5x the
+wall time while still "using 2 cores". Pinning all tasks of the scope to K CPUs on distinct physical
+cores removes that: the K CPUs run flat out at turbo and the quota is never hit (throttled time in
+cpu.stat stays near 0).
+
+So `run` does both: CPUQuota as the cap the admin can read, `sched_setaffinity` on every task in the
+scope (`cgroup.threads`) for throughput. The set is chosen with affinity.choose: keep the current
+CPUs when the quota changes, add CPUs from physical cores not yet in the set, idlest core first
+(core load = sum of its threads' busy fraction over the last interval), drop the busiest when
+shrinking. The main process is pinned right after launch (its pid survives systemd-run's exec and
+children inherit the mask), and every interval all tasks are re-pinned so processes started before a
+change, or that reset their own mask, are caught. `--no-affinity` turns this off.
+
 ## Signal
 
 - `total_busy` = busy cores over the interval from `/proc/stat` (user+nice+system+irq+softirq+steal
@@ -77,3 +101,6 @@ so it is measured (cpusched record) and simulated rather than guessed.
   SIGINT must be stopped with `cpusched stop` or SIGTERM to the wrapper (which is forwarded to the
   whole scope).
 - `others` includes the kernel and system services; that is intended (they need the cores too).
+- Pinning overrides whatever affinity the job sets for itself, once per interval.
+- The CPU set is only recomputed when the quota changes; if another user lands on one of our CPUs
+  meanwhile, the kernel's load balancer moves their (unpinned) task elsewhere, we do not move.

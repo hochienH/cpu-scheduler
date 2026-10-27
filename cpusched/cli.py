@@ -53,6 +53,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--log", type=Path, help="CSV log path (default ~/.local/state/cpusched/<unit>.csv)")
     r.add_argument("--no-log", action="store_true", help="do not write the CSV log")
     r.add_argument("-v", "--verbose", action="store_true", help="print each decision to stderr")
+    r.add_argument("--no-affinity", action="store_true",
+                   help="only set the quota; do not pin the job's tasks to the allowed CPUs (slower, see docs)")
     r.add_argument("command", nargs=argparse.REMAINDER, help="the command to run (after --)")
 
     w = sub.add_parser("watch", help="dry run: print what `run` would decide, without starting a job")
@@ -84,7 +86,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("cpusched run: no command given (write it after --)")
         cfg = _policy(ns)
         log = None if ns.no_log else (ns.log or default_log_dir() / (unit_name(ns.label or cmd[0]) + ".csv"))
-        return run(cmd, cfg, ns.interval, label=ns.label, log_path=log, verbose=ns.verbose)
+        return run(cmd, cfg, ns.interval, label=ns.label, log_path=log, verbose=ns.verbose,
+                   pin=not ns.no_affinity)
     if ns.cmd == "watch":
         from .runner import watch
         return watch(_policy(ns), ns.interval, ns.count)
